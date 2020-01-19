@@ -1,0 +1,5 @@
+The oshbackup is a backup suite intended for easy integration with any
+modern Unix-like OS. It aims at management simplicity and reusing of
+the software already bundled with OS.
+
+The project is far from being complete, see TODO.
