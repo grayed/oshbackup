@@ -3,3 +3,12 @@ modern Unix-like OS. It aims at management simplicity and reusing of
 the software already bundled with OS.
 
 The project is far from being complete, see TODO.
+
+Currently there are two scripts:
+
+* dumpfs - To be run on machine whose filesystems are being backed up.
+  This script starts dump(8) and pushes it via ssh(1) to backup host.
+
+* rotate_fs_dumps - To be run on backup host periodically (or right
+  after backup). This script removes extra dumps being held, unless
+  dumps counts of each level go below the specified limit.
