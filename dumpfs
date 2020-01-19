@@ -1,0 +1,83 @@
+#!/bin/sh
+
+set -e
+
+usage() {
+	test $# -gt 0 && echo "${0##*/}: $*" >&2
+	echo "usage: ${0##*/} [-f] [-h nodumplevel] [-l level] [-n name] host fs ..." >&2
+	exit 1
+}
+
+force=false
+us=$(hostname)
+level=auto
+nodumplevel=1
+while getopts "fl:" OPT; do case $OPT in
+	f)	force=true;;
+	h)	case $OPTARG in
+		[0-9])	nodumplevel=$OPTARG;;
+		*)	usage "invalid nodumplevel: $OPTARG";;
+		esac;;
+	n)	us=$OPTARG;;
+	l)	case $OPTARG in
+		[0-9]|auto)	level=$OPTARG;;
+		*)		usage "invalid dump level: $OPTARG";;
+		esac;;
+	*)	usage;;
+esac; done
+shift $(($OPTIND - 1))
+server=$1; shift || usage
+test $# -gt 0 || usage
+
+date=$(date +%Y-%m-%d)
+weekday=$(date -jf %Y-%m-%d +%u $date)
+
+# day at which level 0 dump should be created in auto mode
+level0_day=$(printf "%02d" $(( $(echo -n "$us" | cksum | awk '{print $1}') % 28 + 1 )) )
+
+last_dump_level_of() {
+	local fs=$1 s
+
+	s=$(dump -W |
+	    grep "([[:space:]]*${fs})" |
+	    grep -iEo 'Level[[:space:]]+[0-9]+' || echo 'Level -1')
+	echo "$s" | cut -d ' ' -f 2
+}
+
+for fs in "$@"; do
+	# safety check
+	fs=$(readlink -f "$fs")
+
+	if [ x"$fs" = x/ ]; then
+		fsname=root
+	else
+		fsname=$(echo "$fs" | sed 's,/,_,g' | cut -c 2-)
+	fi
+
+	case $level in
+	[0-9])
+		this_level=$level
+		;;
+	auto)
+		last_level=$(last_dump_level_of "$fs")
+		if [ $last_level -eq -1 -o $(echo $date | cut -c 9-) = $level0_day ]; then
+			this_level=0
+		elif [ $last_level -eq 0 -o \( $last_level -gt 1 -a $weekday = 1 \) ]; then
+			# monday
+			this_level=1
+		else
+			# TODO: increase level when dumping again same day
+			this_level=2
+		fi
+		;;
+	*)
+		usage
+		;;
+	esac
+
+	dest="${us}/fs/${fsname}.${date}.dump.${this_level}"
+	echo "${0##*/}: dumping ${fs} to ${server}:${dest}" >&2
+	sync
+	dump -$this_level -h $nodumplevel -u -f - "$fs" | ssh $server \
+	    "cat >$dest || { echo -n 'removing '; rm -vf $dest; exit 1; } >&2"
+done

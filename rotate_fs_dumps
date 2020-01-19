@@ -1,0 +1,256 @@
+#!/bin/sh
+
+set -e
+
+err() {
+	printf "%s: %s\n" "${0##*/}" "$*" >&2
+	exit 1
+}
+
+usage() {
+	printf "%s: %s\n" "${0##*/}" "$*" >&2
+	printf "usage: %s [-dnv] hostname ..."
+	exit 1
+}
+
+verbose=false
+debug=false
+dry_run=false
+conffile=~/${0##*/}.conf
+
+while getopts 'dnv' OPT; do case $OPT in
+	d)	debug=true;;
+	f)	conffile=$OPTARG;;
+	n)	dry_run=true;;
+	v)	verbose=true;;
+	*)	usage;;
+esac; done
+
+shift $((OPTIND - 1))
+test $# -gt 0 || usage
+
+# set defaults
+for lvl in $(jot 10 0); do
+	eval "max_dumps_${lvl}=0"
+done
+max_dumps_0=2
+max_dumps_1=2
+max_dumps_2=5
+
+validate_max_dumps() {
+	case $2 in
+	[0-9]|[0-9][0-9]|[0-9][0-9][0-9])
+		;;
+	*)
+		err "invalid $1 value: $2"
+		;;
+	esac
+}
+
+# read configuration file, if any
+test -z "$conffile" || while IFS='=' read -r opt value; do
+	case $opt in
+	\#*|"")
+		# skip empty lines (do not care about '=foo' cases)
+		;;
+	max_dumps_[0-9])
+		validate_max_dumps "$opt" "$value"
+		eval "$opt=\"\$value\""
+		;;
+	*)
+		err "invalid configuration parameter $opt"
+		;;
+	esac
+done <"$conffile"
+
+#
+# Configuration handling done.
+# Now defining actual routines and run them.
+#
+
+group_re='[a-zA-Z_][a-zA-Z0-9_]*'
+suffix_re='\.([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])\.dump\.([0-9])'
+
+notice() {
+	if $verbose; then
+		printf "%s\n" "$*" >&2
+	fi
+}
+
+debug() {
+	if $debug; then
+		printf "%s\n" "$*" >&2
+	fi
+}
+
+dump_lvl() {
+	echo "$1" | grep -o '.$'
+}
+
+dump_date() {
+	echo "$1" | sed -e 's/^[^.]*\.//;' -e 's/\..*//;'
+}
+
+dump_group() {
+	echo "$1" | sed -E "s/$suffix_re\$//"
+}
+
+dump_id() {
+	local dump lvl date group
+
+	dump=$1
+	lvl=$(dump_lvl "$dump")
+	date=$(dump_date "$dump" | sed 's/-/_/g')
+	group=$(dump_group "$dump")
+	echo "${lvl}_${date}_${group}"
+}
+
+dump_from_id() {
+	local group date lvl id
+
+	id=$1
+	lvl=$(echo $id | cut -c 1)
+	date=$(echo $id | cut -c 3-12 | sed 's/_/-/g')
+	group=$(echo $id | cut -c 14-)
+	echo "${group}.${date}.dump.${lvl}"
+}
+
+register_dump() {
+	local dump lvl closest
+
+	dump=$1
+	lvl=$(dump_lvl $dump)
+	all_dumps="$all_dumps $dump"
+	eval "dumps_${lvl}=\"\$dumps_${lvl} $dump\""
+	eval "cnt_${lvl}=\$((cnt_${lvl} + 1))"
+
+	closest=$(closest_parent_for_lvl $lvl)
+	if [ -n "$closest" ]; then
+		add_dep "$closest" "$dump"
+	fi
+
+	eval "debug '  registered' $dump, now we have \$cnt_${lvl} dumps of $lvl level"
+}
+
+unregister_dump() {
+	local dump lvl old_all_dumps
+
+	dump=$1
+	lvl=$(dump_lvl $dump)
+	old_all_dumps=$(echo $all_dumps | xargs)
+	all_dumps=$(echo $all_dumps | sed "s/$dump//" | xargs)
+	if [ x"$all_dumps" != x"$old_all_dumps" ]; then
+		eval "dumps_${lvl}=\$(echo \$dumps_${lvl} | sed 's/$dump//')"
+		eval "cnt_${lvl}=\$((cnt_${lvl} - 1))"
+
+		eval "debug unregistered $dump, now we have \$cnt_${lvl} dumps of $lvl level"
+		eval "test \$cnt_${lvl} -ge 0" || err "internal error: cnt_${lvl} became less than zero"
+	else
+		debug "already forgotten the $dump, skipping"
+	fi
+}
+
+first_dump_of_lvl() {
+	local dump dumps lvl
+
+	lvl=$1
+	eval "dumps=\$dumps_${lvl}"
+	for dump in $dumps; do
+		echo "$dump"
+		break
+	done
+}
+
+closest_parent_for_lvl() {
+	local lvl dump dumps closest
+
+	lvl=$1
+	if [ $lvl = 0 ]; then
+		return
+	fi
+	for dump in $all_dumps; do
+		if [ $(dump_lvl "$dump") -lt $lvl ]; then
+			closest=$dump
+		fi
+	done
+	echo "$closest"
+}
+
+add_dep() {
+	local parent_id child_id
+
+	parent_id=$(dump_id "$1")
+	child_id=$(dump_id "$2")
+	eval "dependees_of_${parent_id}=\"\$dependees_of_${parent_id} \$child_id\""
+}
+
+recursive_deps_of() {
+	local parent_id children_ids child_id child
+
+	debug "recursive_deps_of $*"
+	parent_id=$(dump_id "$1")
+	eval "children_ids=\$dependees_of_${parent_id}"
+	for child_id in $children_ids; do
+		child=$(dump_from_id $child_id)
+		recursive_deps_of "$child"
+		echo "$child"
+	done
+}
+
+remove_dump() {
+	local dump
+
+	dump=$1
+	notice "====> removing $dump"
+	$dry_run || rm -f -- "$dump"
+	unregister_dump "$dump"
+}
+
+remove_earliest_dump_of_lvl() {
+	local lvl dump deps f
+
+	lvl=$1
+	dump=$(first_dump_of_lvl $lvl)
+	debug "remove_earliest_dump_of_lvl: lvl=$lvl dump=$dump"
+	deps=$(recursive_deps_of $dump)
+	for f in $deps $dump; do
+		remove_dump "$f"
+	done
+}
+
+rotate_group() (
+	group=$1
+	notice "====> rotating group $group"
+
+	all_dumps=
+	for lvl in $(jot 10 0); do
+		eval "cnt_${lvl}=0"
+		eval "dumps_${lvl}="
+	done
+
+	ls -d "$group".* | grep -E "${suffix_re}\$" | while read dump; do
+		test -f "$dump" || continue
+		debug "  processing $dump"
+		lvl=$(dump_lvl "$dump")
+		eval "cnt=\$cnt_${lvl}"
+		eval "max=\$max_dumps_${lvl}"
+		if [ $max -eq 0 ]; then
+			remove_dump "$dump"
+		else
+			while [ $cnt -ge $max ]; do
+				remove_earliest_dump_of_lvl $lvl
+				cnt=$((cnt - 1))
+			done
+			register_dump "$dump"
+		fi
+	done
+)
+
+for host in "$@"; do (
+	notice "===> rotating dumps for $host"
+	cd -- "$host"/fs
+	prefixes=$(ls -f | awk -F . "/^${group_re}${suffix_re}\$/ {print \$1}" | sort -u)
+	for prefix in $prefixes; do
+		rotate_group "$prefix"
+	done
+); done

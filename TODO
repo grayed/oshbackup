@@ -1,0 +1,13 @@
+Before the 1.0 release:
+
+  * Implement dumping of DBMS.
+  * Add support for dump initiation from the backup host.
+  * Manpages.
+  * Example Ansible role.
+
+At some later point in the future:
+
+  * Setup script(s).
+  * Support dumps with better resoulution than once per day.
+    * For 'auto' dump level increase actual level when dumping again same day.
+  * Implement separate controller script (daemon).
